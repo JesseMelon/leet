@@ -1,3 +1,0 @@
-/home/melon/Dev/yt/code/leet/build/CMakeFiles/leet_out.dir
-/home/melon/Dev/yt/code/leet/build/CMakeFiles/edit_cache.dir
-/home/melon/Dev/yt/code/leet/build/CMakeFiles/rebuild_cache.dir
