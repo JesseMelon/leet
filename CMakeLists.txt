@@ -7,7 +7,13 @@ set(CMAKE_C_STANDARD_REQUIRED ON)
 set(CMAKE_C_EXTENSIONS ON)
 set(CMAKE_C_COMPILER "gcc")
 
-add_compile_options(-O2 -fsanitize=address)
+if(${DEBUG})
+    add_compile_options(-g)
+else()
+    add_compile_options(-O2)
+endif()
+
+add_compile_options(-fsanitize=address)
 add_link_options(-fsanitize=address)
 
 # uthash sucks

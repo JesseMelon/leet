@@ -1,3 +1,4 @@
+#include <stddef.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <stdint.h>
@@ -58,7 +59,7 @@
 
 #define OFFSET 1000000001
 #define KEY_BITS 11U
-#define NUM_BUCKETS 2048U // 1 << KEY_BITS
+#define NUM_BUCKETS 2048ULL // 1 << KEY_BITS
 
 __attribute__((target("avx2"))) //
 int* twoSum(int* nums, int n, int target, int* returnsize)
@@ -74,73 +75,124 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 
 	// Shift target into positive range
 	target = target + OFFSET;
-	LOG("Target post shift: %032b\n", target);
+	LOG("Target is now %d, %032b\n", target, target);
 
 	// Find most significant bit of target
 	uint8_t lz = __builtin_clz(target);
+	LOG("Target has %d leading zeros\n", lz);
 	uint8_t msb_pos = 32 - lz;
+	LOG("Position of MSB is %d\n", msb_pos);
 	// shift = position of most significant bits of target or bottom bits
 	uint8_t key_shift =
 		(msb_pos > (int)KEY_BITS) ? msb_pos - (int)KEY_BITS : 0;
-	// Shift 1 left by KEYBITS then subtract 1 to set all bits below the 1
-	uint32_t key_mask = (1U << KEY_BITS) - 1U;
-	// shift the key mask to use only the used bits
-	key_mask <<= key_shift;
-	LOG("Keymask: %032b\n", key_mask);
+	LOG("Key will be left shifted by %d\n", key_shift);
+	// Shift 1 left by KEYBITS then subtract 1 to set all bits below the 1,
+	// then shift by key_shift to align to target most signigicant bits
+	uint32_t key_mask = ((1U << KEY_BITS) - 1U) << key_shift;
+	LOG("Key mask is: %032b\n", key_mask);
 
-	uint8_t bkt_accumulators[8 * NUM_BUCKETS] = {0};
 	const __m256i OFFSET_V = _mm256_set1_epi32(OFFSET);
 	const __m256i KEY_MASK_V = _mm256_set1_epi32((int)key_mask);
 
-	// TODO: Pessimistically repeat this loop for subsets of n such that
-	// uint8 overflow is impossible
-	for (int i = 0; i <= n - 16; i += 16) {
-		// Load 8 nums
-		__m256i v_nums1 = _mm256_loadu_si256((__m256i*)(nums + i));
-		__m256i v_nums2 = _mm256_loadu_si256((__m256i*)(nums + i + 8));
-		// Offset to positive
-		__m256i pos_nums1 = _mm256_add_epi32(v_nums1, OFFSET_V);
-		__m256i pos_nums2 = _mm256_add_epi32(v_nums2, OFFSET_V);
-		// Mask off key and shift to bottom of register
-		__m256i ymmkeys1 = _mm256_srli_epi32(
-			_mm256_and_epi32(pos_nums1, KEY_MASK_V),
-			(int)key_shift);
-		__m256i ymmkeys2 = _mm256_srli_epi32(
-			_mm256_and_epi32(pos_nums2, KEY_MASK_V),
-			(int)key_shift);
-
-		// Due to store to load forwarding, we want these to be 32 bit
-		// And moved into general purpose registers all at once
-		alignas(32) uint32_t gpr_keys[16];
-
-		_mm256_store_si256((__m256i*)&gpr_keys[0], ymmkeys1);
-		_mm256_store_si256((__m256i*)&gpr_keys[8], ymmkeys2);
-
-		// no inter-lane dependency, look ahead can optimize
-		bkt_accumulators[gpr_keys[0] + (0 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[1] + (1 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[2] + (2 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[3] + (3 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[4] + (4 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[5] + (5 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[6] + (6 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[7] + (7 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[8] + (0 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[9] + (1 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[10] + (2 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[11] + (3 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[12] + (4 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[13] + (5 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[14] + (6 * NUM_BUCKETS)]++;
-		bkt_accumulators[gpr_keys[15] + (7 * NUM_BUCKETS)]++;
-	} // End for
-	// TODO: tail
-
 	uint16_t bkt_counts[NUM_BUCKETS] = {0};
 
-	// Gather buckets
+	// Start a new scope block because accs uses 32+ KB (11+ bit
+	// key), and doesnt need to persist for the entire function. This
+	// reduces the total stack depth for if we need other arrays later, and
+	// helps to stay in cache somewhat. TODO: Measure this
+	{
+		// 8 long arrays
+		uint16_t accs[8][NUM_BUCKETS] = {0};
 
-	// Store to hash
+		for (int i = 0; i < n; i += 16) {
+			// Load 8 nums
+			__m256i v_nums1 =
+				_mm256_loadu_si256((__m256i*)(nums + i));
+			__m256i v_nums2 =
+				_mm256_loadu_si256((__m256i*)(nums + i + 8));
+			// Offset to positive
+			__m256i pos_nums1 = _mm256_add_epi32(v_nums1, OFFSET_V);
+			__m256i pos_nums2 = _mm256_add_epi32(v_nums2, OFFSET_V);
+			// Mask off key and shift to bottom of register
+			__m256i mask_nums1 =
+				_mm256_and_si256(pos_nums1, KEY_MASK_V);
+			__m256i mask_nums2 =
+				_mm256_and_si256(pos_nums2, KEY_MASK_V);
+			__m256i ymmkeys1 =
+				_mm256_srli_epi32(mask_nums1, key_shift);
+			__m256i ymmkeys2 =
+				_mm256_srli_epi32(mask_nums2, key_shift);
+
+			// Due to store to load forwarding, we want these to be
+			// 32 bit And moved into general purpose registers once
+			alignas(32) uint32_t gpr_keys[16];
+
+			_mm256_store_si256((__m256i*)&gpr_keys[0], ymmkeys1);
+			_mm256_store_si256((__m256i*)&gpr_keys[8], ymmkeys2);
+
+			for (int j = 0; j < 16; j++) {
+				LOG("entry %d shifted: %d, %032b. Key: %d, "
+				    "%032b\n",
+				    nums[i + j], nums[i + j] + OFFSET,
+				    nums[i + j] + OFFSET, gpr_keys[j],
+				    gpr_keys[j]);
+			}
+
+			// no inter-lane dependency, look ahead can optimize
+			// NOTE: If data were larger, tiling would be better
+			// Tiling would use 8 * 16 buckets sets, and use mod 8
+			// indices via '& 7' paired with '>> 3' during indexing
+			accs[0][gpr_keys[0]]++;
+			accs[1][gpr_keys[1]]++;
+			accs[2][gpr_keys[2]]++;
+			accs[3][gpr_keys[3]]++;
+			accs[4][gpr_keys[4]]++;
+			accs[5][gpr_keys[5]]++;
+			accs[6][gpr_keys[6]]++;
+			accs[7][gpr_keys[7]]++;
+			accs[0][gpr_keys[8]]++;
+			accs[1][gpr_keys[9]]++;
+			accs[2][gpr_keys[10]]++;
+			accs[3][gpr_keys[11]]++;
+			accs[4][gpr_keys[12]]++;
+			accs[5][gpr_keys[13]]++;
+			accs[6][gpr_keys[14]]++;
+			accs[7][gpr_keys[15]]++;
+
+		} // End for
+		// TODO: tail
+
+		// reduce final bucket counts
+		for (uint32_t b = 0; b < NUM_BUCKETS; b += 16) {
+			__m256i t = _mm256_setzero_si256();
+
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[0][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[1][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[2][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[3][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[4][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[5][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[6][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[7][b]));
+			_mm256_storeu_si256((__m256i*)(bkt_counts + b), t);
+		}
+	} // end scope block
+
+	for (int b = 640; b < 650; b++) {
+		LOG("bucket %d = %d\n", b, bkt_counts[b]);
+	}
+
+	// Store to hash (stack, obvi)
+	uint8_t fingerp[n];
+	uint32_t payload[n];
 
 	// Compare highest magnitudes down
 
@@ -153,10 +205,11 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 
 int main()
 {
-	int numsize = 4;
-	int nums[] = {2, 7, 11, 15, 99, 3, 8, 9};
+	int numsize = 16;
+	int nums[] = {2,   7,	4096, 4097, 99, 3, 8, 9,
+		      100, 101, 102,  103,  1,	4, 5, 6};
 	// NOTE: Demonstrate the shifting key_mask
-	int target = -1000000000;
+	int target = 4096 - 1000000000;
 	int retsize = 0;
 	int* retvals = NULL;
 
