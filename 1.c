@@ -5,8 +5,13 @@
 #include <stdalign.h>
 #include <immintrin.h>
 
-// TODO: rip through the array and count bucket sizes
-// simultaneously make a uint8_t [10,000] mapping
+// TODO: While looking at nums[i] determine if the complement will cause an
+// overflow, and use that to determine a flag as part of the key. This recovers
+// the deterministic complement property for the creation of the hash table
+
+// TODO: The above is half done, but I realize I need to consider the ambiguous
+// bit IN the key mask, not beside it. Therefore some of the shifting etc needs
+// adjusted on the analysis part, not the storage
 #define DEBUG
 
 #ifdef DEBUG
@@ -50,16 +55,35 @@
 	do {                                                                   \
 		printf(msg, ##__VA_ARGS__);                                    \
 	} while (0)
+#define VLOG(vec)                                                              \
+	do {                                                                   \
+		alignas(32) int c[8];                                          \
+		_mm256_store_si256((__m256i*)c, vec);                          \
+		printf("%s: %d %d %d %d %d %d %d %d\n", #vec, c[0], c[1],      \
+		       c[2], c[3], c[4], c[5], c[6], c[7]);                    \
+	} while (0)
+#define VLOGB(vec)                                                             \
+	do {                                                                   \
+		alignas(32) int c[8];                                          \
+		_mm256_store_si256((__m256i*)c, vec);                          \
+		printf("%s:\n%u\t%032b\n%u\t%032b\n%u\t%032b\n%u\t%032b\n%u\t" \
+		       "%032b\n%u\t%032b\n%u\t%032b\n%u\t%032b\n",             \
+		       #vec, c[0], c[0], c[1], c[1], c[2], c[2], c[3], c[3],   \
+		       c[4], c[4], c[5], c[5], c[6], c[6], c[7], c[7]);        \
+	} while (0)
 #else
 #define SYS_EVAL()
 #define TIME(code) code
 #define CHECK_ALIGN(ptr, bytes)
 #define LOG(msg)
+#define VLOG(vec)
+#define VLOGB(vec)
 #endif
 
 #define OFFSET 1000000001
-#define KEY_BITS 11U
-#define NUM_BUCKETS 2048ULL // 1 << KEY_BITS
+#define KEY_BITS 11U	   // TODO: Make dynamic?
+#define NUM_BUCKETS 2048U  // 1 << KEY_BITS
+#define BUCKET_BITFLAGS 32 // NUM_BUCKETS / 64
 
 __attribute__((target("avx2"))) //
 int* twoSum(int* nums, int n, int target, int* returnsize)
@@ -74,54 +98,81 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 	}
 
 	// Shift target into positive range
-	target = target + OFFSET;
-	LOG("Target is now %d, %032b\n", target, target);
+	uint32_t ptgt = target + (2 * OFFSET);
+	LOG("Target is now %u, %032b\n", ptgt, ptgt);
 
 	// Find most significant bit of target
-	uint8_t lz = __builtin_clz(target);
-	LOG("Target has %d leading zeros\n", lz);
+	uint8_t lz = __builtin_clz(ptgt);
+	LOG("Target has %u leading zeros\n", lz);
 	uint8_t msb_pos = 32 - lz;
-	LOG("Position of MSB is %d\n", msb_pos);
+	LOG("Position of MSB is %u\n", msb_pos);
+
 	// shift = position of most significant bits of target or bottom bits
-	uint8_t key_shift =
-		(msb_pos > (int)KEY_BITS) ? msb_pos - (int)KEY_BITS : 0;
-	LOG("Key will be left shifted by %d\n", key_shift);
-	// Shift 1 left by KEYBITS then subtract 1 to set all bits below the 1,
-	// then shift by key_shift to align to target most signigicant bits
-	uint32_t key_mask = ((1U << KEY_BITS) - 1U) << key_shift;
-	LOG("Key mask is: %032b\n", key_mask);
+	// Last bit will be the complement carry flag
+	uint8_t key_shift = (msb_pos > KEY_BITS) ? msb_pos - KEY_BITS : 0;
+	LOG("Key will be shifted by %u\n", key_shift);
+
+	LOG("possible numbers per bucket is %u\n", 1U << (key_shift));
+	// All keybits but one will be a mask of nums
+	uint32_t num_mask = ((1U << (KEY_BITS - 1U)) - 1U) << (key_shift + 1U);
+	LOG("Key mask is: %032b\n", num_mask);
+	// Least signif keybit is complement carry flag
+	uint32_t low_bit = 1U << (key_shift);
+	LOG("Low bit is: %032b\n", low_bit);
 
 	const __m256i OFFSET_V = _mm256_set1_epi32(OFFSET);
-	const __m256i KEY_MASK_V = _mm256_set1_epi32((int)key_mask);
+	const __m256i KEY_MASK_V = _mm256_set1_epi32((int)num_mask);
+	const __m256i LOW_BIT_V = _mm256_set1_epi32((int)low_bit);
+	const __m256i TARGET_V = _mm256_set1_epi32((int)ptgt);
 
+	// bkt_idx & bkt_counts share memory
 	uint16_t bkt_counts[NUM_BUCKETS] = {0};
 
-	// Start a new scope block because accs uses 32+ KB (11+ bit
+	// Start a new scope block because accs uses 32+ KB ( With 11+ bit
 	// key), and doesnt need to persist for the entire function. This
 	// reduces the total stack depth for if we need other arrays later, and
-	// helps to stay in cache somewhat. TODO: Measure this
+	// helps to stay in cache somewhat. TODO: Measure this?
 	{
 		// 8 long arrays
 		uint16_t accs[8][NUM_BUCKETS] = {0};
 
 		for (int i = 0; i < n; i += 16) {
 			// Load 8 nums
-			__m256i v_nums1 =
+			__m256i vnums1 =
 				_mm256_loadu_si256((__m256i*)(nums + i));
-			__m256i v_nums2 =
+			__m256i vnums2 =
 				_mm256_loadu_si256((__m256i*)(nums + i + 8));
 			// Offset to positive
-			__m256i pos_nums1 = _mm256_add_epi32(v_nums1, OFFSET_V);
-			__m256i pos_nums2 = _mm256_add_epi32(v_nums2, OFFSET_V);
+			__m256i pnums1 = _mm256_add_epi32(vnums1, OFFSET_V);
+			__m256i pnums2 = _mm256_add_epi32(vnums2, OFFSET_V);
 			// Mask off key and shift to bottom of register
 			__m256i mask_nums1 =
-				_mm256_and_si256(pos_nums1, KEY_MASK_V);
+				_mm256_and_si256(pnums1, KEY_MASK_V);
 			__m256i mask_nums2 =
-				_mm256_and_si256(pos_nums2, KEY_MASK_V);
-			__m256i ymmkeys1 =
-				_mm256_srli_epi32(mask_nums1, key_shift);
-			__m256i ymmkeys2 =
-				_mm256_srli_epi32(mask_nums2, key_shift);
+				_mm256_and_si256(pnums2, KEY_MASK_V);
+			// Calculate full complement of nums[i]
+			__m256i compls1 = _mm256_sub_epi32(TARGET_V, pnums1);
+			__m256i compls2 = _mm256_sub_epi32(TARGET_V, pnums2);
+			VLOGB(compls1);
+
+			// TODO: needless shift?
+			// Isolate the possibly overflowed low bit
+			__m256i mask_compl1 = _mm256_srli_epi32(
+				_mm256_and_si256(compls1, LOW_BIT_V), 0);
+			VLOGB(_mm256_and_si256(compls1, LOW_BIT_V));
+			VLOGB(mask_compl1);
+			__m256i mask_compl2 = _mm256_srli_epi32(
+				_mm256_and_si256(compls2, LOW_BIT_V), 0);
+			// Combine this bit value with the rest of the key
+			// NOTE: In the event that key is shifted by 0, lowest
+			// bit will not exist since the key is the entire value
+			// so there is no conditionality around the right shift
+			__m256i ymmkeys1 = _mm256_srli_epi32(
+				_mm256_or_si256(mask_nums1, mask_compl1),
+				key_shift);
+			__m256i ymmkeys2 = _mm256_srli_epi32(
+				_mm256_or_si256(mask_nums2, mask_compl2),
+				key_shift);
 
 			// Due to store to load forwarding, we want these to be
 			// 32 bit And moved into general purpose registers once
@@ -131,7 +182,7 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 			_mm256_store_si256((__m256i*)&gpr_keys[8], ymmkeys2);
 
 			for (int j = 0; j < 16; j++) {
-				LOG("entry %d shifted: %d, %032b. Key: %d, "
+				LOG("entry %u shifted: %u, %032b. Key: %u, "
 				    "%032b\n",
 				    nums[i + j], nums[i + j] + OFFSET,
 				    nums[i + j] + OFFSET, gpr_keys[j],
@@ -186,13 +237,23 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 		}
 	} // end scope block
 
-	for (int b = 640; b < 650; b++) {
-		LOG("bucket %d = %d\n", b, bkt_counts[b]);
+	for (int b = 1906; b < 1916; b++) {
+		LOG("bucket %u = %u\n", b, bkt_counts[b]);
 	}
 
 	// Store to hash (stack, obvi)
 	uint8_t fingerp[n];
 	uint32_t payload[n];
+	// Need for bkt idx, and bkt counts are m-xclusive, so save ~4KB stack
+	uint16_t* bkt_idx = bkt_counts;
+
+	// Store complements adjacent
+	// Decompose target key into two solution keys
+	// Start at target key, and work down (ignoring keys above tgt)
+	uint16_t tg_key = (ptgt & num_mask) >> key_shift;
+	LOG("Target key: %u, %016b\n", tg_key, tg_key);
+
+	// For every non-empty bucket with non-empty compliment bucket
 
 	// Compare highest magnitudes down
 
@@ -206,10 +267,24 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 int main()
 {
 	int numsize = 16;
-	int nums[] = {2,   7,	4096, 4097, 99, 3, 8, 9,
-		      100, 101, 102,  103,  1,	4, 5, 6};
+	int nums[] = {2,
+		      7,
+		      4096,
+		      4097,
+		      99 - OFFSET,
+		      3 - (OFFSET / 2),
+		      8 - (OFFSET / 4),
+		      9 - (OFFSET / 8),
+		      100,
+		      101,
+		      102,
+		      103,
+		      1,
+		      4,
+		      5,
+		      6};
 	// NOTE: Demonstrate the shifting key_mask
-	int target = 4096 - 1000000000;
+	int target = 12;
 	int retsize = 0;
 	int* retvals = NULL;
 
