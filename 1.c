@@ -5,13 +5,14 @@
 #include <stdalign.h>
 #include <immintrin.h>
 
-// TODO: While looking at nums[i] determine if the complement will cause an
-// overflow, and use that to determine a flag as part of the key. This recovers
-// the deterministic complement property for the creation of the hash table
+// TODO: keys have even/odd and carry bit, but carry bit is wasted on one of the
+// keys, thus we split to two functions, leave the branch as one branch early on
 
-// TODO: The above is half done, but I realize I need to consider the ambiguous
-// bit IN the key mask, not beside it. Therefore some of the shifting etc needs
-// adjusted on the analysis part, not the storage
+// TODO: incorporate even/odd into the key, this can help keys reduce misses
+// alot.
+
+// TODO: branch early on even/odd key
+
 #define DEBUG
 
 #ifdef DEBUG
@@ -66,8 +67,9 @@
 	do {                                                                   \
 		alignas(32) int c[8];                                          \
 		_mm256_store_si256((__m256i*)c, vec);                          \
-		printf("%s:\n%u\t%032b\n%u\t%032b\n%u\t%032b\n%u\t%032b\n%u\t" \
-		       "%032b\n%u\t%032b\n%u\t%032b\n%u\t%032b\n",             \
+		printf("%s:\n%10u\t%032b\n%10u\t%032b\n%10u\t%032b\n%10u\t%"   \
+		       "032b\n%10u\t"                                          \
+		       "%032b\n%10u\t%032b\n%10u\t%032b\n%10u\t%032b\n",       \
 		       #vec, c[0], c[0], c[1], c[1], c[2], c[2], c[3], c[3],   \
 		       c[4], c[4], c[5], c[5], c[6], c[6], c[7], c[7]);        \
 	} while (0)
@@ -81,14 +83,28 @@
 #endif
 
 #define OFFSET 1000000001
-#define KEY_BITS 11U	   // TODO: Make dynamic?
-#define NUM_BUCKETS 2048U  // 1 << KEY_BITS
-#define BUCKET_BITFLAGS 32 // NUM_BUCKETS / 64
+#define KEY_BITS 11U		 // TODO: Make dynamic?
+#define ODD_BITS (KEY_BITS - 2U) // section of key from num
+#define NUM_BUCKETS 2048U	 // 1 << KEY_BITS
 
+inline void odd_prefix(int* nums, int n, int target, uint32_t ptgt,
+		       uint8_t key_shift);
+inline void even_prefix(int* nums, int n, int target, uint32_t ptgt,
+			uint8_t key_shift);
+
+/*==============================================================================
+ *
+ * TWO SUM
+ *
+ * - applies constant offset to entire problem set
+ * --- allows existence culling based on magnitude
+ *
+ * - custom hash
+ * --- 11 bits, 1 carry indicator, then vals correlated to 10 msb bits of target
+------------------------------------------------------------------------------*/
 __attribute__((target("avx2"))) //
 int* twoSum(int* nums, int n, int target, int* returnsize)
 {
-
 	// SYS_EVAL();
 	// CHECK_ALIGN(nums, 32);
 	int* retvals = malloc(sizeof(int) * 2);
@@ -97,32 +113,88 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 		return NULL;
 	}
 
-	// Shift target into positive range
 	uint32_t ptgt = target + (2 * OFFSET);
-	LOG("Target is now %u, %032b\n", ptgt, ptgt);
-
-	// Find most significant bit of target
+	LOG("Target %d is now shifted to %u, %032b\n", target, ptgt, ptgt);
 	uint8_t lz = __builtin_clz(ptgt);
 	LOG("Target has %u leading zeros\n", lz);
 	uint8_t msb_pos = 32 - lz;
-	LOG("Position of MSB is %u\n", msb_pos);
-
+	LOG("Position of MSB is %u\n", msb_pos - 1);
 	// shift = position of most significant bits of target or bottom bits
-	// Last bit will be the complement carry flag
-	uint8_t key_shift = (msb_pos > KEY_BITS) ? msb_pos - KEY_BITS : 0;
+	uint8_t key_shift = (msb_pos > KEY_BITS) ? msb_pos - ODD_BITS : 0;
 	LOG("Key will be shifted by %u\n", key_shift);
+	LOG("1U << keyshift: %032b\n", 1U << key_shift);
 
+	if ((uint)target & 1U << (key_shift - 1U)) {
+		LOG("Prefix is odd\n");
+		odd_prefix(nums, n, target, ptgt, key_shift);
+	} else {
+		LOG("Prefix is even\n");
+		even_prefix(nums, n, target, ptgt, key_shift);
+	}
+
+	retvals[0] = 0;
+	retvals[1] = 1;
+
+	*returnsize = 2;
+	return retvals;
+}
+
+int main()
+{
+	int numsize = 16;
+	int nums[] = {2,
+		      7,
+		      4096,
+		      4097,
+		      99 - OFFSET,
+		      3 - (OFFSET / 2),
+		      8 - (OFFSET / 4),
+		      9 - (OFFSET / 8),
+		      100,
+		      101,
+		      102,
+		      103,
+		      1,
+		      4,
+		      5,
+		      6};
+	// NOTE: Demonstrate the shifting key_mask
+	int target = 9;
+	int retsize = 0;
+	int* retvals = NULL;
+
+	TIME(retvals = twoSum(nums, numsize, target, &retsize););
+
+	if (retvals && nums[retvals[0]] + nums[retvals[1]] == target) {
+		free(retvals);
+		return 0;
+	}
+	free(retvals);
+	return 1;
+}
+
+__attribute__((target("avx2"))) //
+void odd_prefix(int* nums, int n, int target, uint32_t ptgt, uint8_t key_shift)
+{
 	LOG("possible numbers per bucket is %u\n", 1U << (key_shift));
 	// All keybits but one will be a mask of nums
-	uint32_t num_mask = ((1U << (KEY_BITS - 1U)) - 1U) << (key_shift + 1U);
-	LOG("Key mask is: %032b\n", num_mask);
+	uint32_t num_mask = ((1U << ODD_BITS) - 1U) << (key_shift);
+	LOG("Key mask is:\t%032b\n", num_mask);
 	// Least signif keybit is complement carry flag
-	uint32_t low_bit = 1U << (key_shift);
-	LOG("Low bit is: %032b\n", low_bit);
+	uint32_t carry_bit = 1U << (key_shift);
+	LOG("Low bit is:\t%032b\n", carry_bit);
+
+	// Calculate target key
+	uint16_t tg_key = ((ptgt & num_mask) >> key_shift) |
+			  ((uint16_t)target & 1U) << ODD_BITS;
+	LOG("Target key: %u, %016b\n", tg_key, tg_key);
 
 	const __m256i OFFSET_V = _mm256_set1_epi32(OFFSET);
 	const __m256i KEY_MASK_V = _mm256_set1_epi32((int)num_mask);
-	const __m256i LOW_BIT_V = _mm256_set1_epi32((int)low_bit);
+	const __m256i LOW_BIT_V = _mm256_set1_epi32((int)carry_bit);
+	const __m256i ONE_BIT_V = _mm256_set1_epi32(1U);
+	const __m256i HIGH_BIT_V = _mm256_set1_epi32(1U << (KEY_BITS - 1U));
+	const __m256i EVEN_BIT_V = _mm256_set1_epi32(1U << (KEY_BITS - 2U));
 	const __m256i TARGET_V = _mm256_set1_epi32((int)ptgt);
 
 	// bkt_idx & bkt_counts share memory
@@ -155,27 +227,46 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 			__m256i compls2 = _mm256_sub_epi32(TARGET_V, pnums2);
 			VLOGB(compls1);
 
-			// TODO: needless shift?
 			// Isolate the possibly overflowed low bit
-			__m256i mask_compl1 = _mm256_srli_epi32(
-				_mm256_and_si256(compls1, LOW_BIT_V), 0);
+			// This is asking "does the complement have the bit set
+			// before the operation?"
+			__m256i carry1 = _mm256_cmpeq_epi32(
+				_mm256_andnot_si256(compls1, LOW_BIT_V),
+				LOW_BIT_V);
 			VLOGB(_mm256_and_si256(compls1, LOW_BIT_V));
-			VLOGB(mask_compl1);
-			__m256i mask_compl2 = _mm256_srli_epi32(
-				_mm256_and_si256(compls2, LOW_BIT_V), 0);
-			// Combine this bit value with the rest of the key
-			// NOTE: In the event that key is shifted by 0, lowest
-			// bit will not exist since the key is the entire value
-			// so there is no conditionality around the right shift
-			__m256i ymmkeys1 = _mm256_srli_epi32(
-				_mm256_or_si256(mask_nums1, mask_compl1),
-				key_shift);
-			__m256i ymmkeys2 = _mm256_srli_epi32(
-				_mm256_or_si256(mask_nums2, mask_compl2),
-				key_shift);
+			VLOGB(carry1);
+			__m256i carry2 = _mm256_cmpeq_epi32(
+				_mm256_andnot_si256(compls2, LOW_BIT_V),
+				LOW_BIT_V);
+			// Is the num even or odd
+			__m256i even1 = _mm256_cmpeq_epi32(
+				_mm256_and_si256(vnums1, ONE_BIT_V), ONE_BIT_V);
+			VLOGB(even1);
+			__m256i even2 = _mm256_cmpeq_epi32(
+				_mm256_and_si256(vnums2, ONE_BIT_V), ONE_BIT_V);
+			// Shift 10 bit keys to bottom
+			__m256i shift_nums1 =
+				_mm256_srli_epi32(mask_nums1, key_shift);
+			__m256i shift_nums2 =
+				_mm256_srli_epi32(mask_nums2, key_shift);
+			// Apply even/odd bit to key
+			__m256i even_key1 = _mm256_or_si256(
+				_mm256_and_si256(even1, EVEN_BIT_V),
+				shift_nums1);
+			__m256i even_key2 = _mm256_or_si256(
+				_mm256_and_si256(even2, EVEN_BIT_V),
+				shift_nums2);
+			// Apply carry bit to key
+			__m256i ymmkeys1 = _mm256_or_si256(
+				_mm256_and_si256(carry1, HIGH_BIT_V),
+				even_key1);
+			__m256i ymmkeys2 = _mm256_or_si256(
+				_mm256_and_si256(carry2, HIGH_BIT_V),
+				even_key2);
 
-			// Due to store to load forwarding, we want these to be
-			// 32 bit And moved into general purpose registers once
+			// Due to store to load forwarding, we want
+			// these to be 32 bit And moved into general
+			// purpose registers once
 			alignas(32) uint32_t gpr_keys[16];
 
 			_mm256_store_si256((__m256i*)&gpr_keys[0], ymmkeys1);
@@ -237,65 +328,263 @@ int* twoSum(int* nums, int n, int target, int* returnsize)
 		}
 	} // end scope block
 
-	for (int b = 1906; b < 1916; b++) {
+	for (int a = 1260, b = a; b < a + 10; b++) {
 		LOG("bucket %u = %u\n", b, bkt_counts[b]);
 	}
 
 	// Store to hash (stack, obvi)
-	uint8_t fingerp[n];
-	uint32_t payload[n];
+	// uint8_t fingerp[n];
+	// uint32_t payload[n];
+
+	// Used to quickly check a bucket is considered before value to hash
+	uint64_t bkt_exist_bits[NUM_BUCKETS / 64] = {0};
+
+	uint16_t offset = 0, count;
+
 	// Need for bkt idx, and bkt counts are m-xclusive, so save ~4KB stack
 	uint16_t* bkt_idx = bkt_counts;
 
 	// Store complements adjacent
 	// Decompose target key into two solution keys
 	// Start at target key, and work down (ignoring keys above tgt)
-	uint16_t tg_key = (ptgt & num_mask) >> key_shift;
-	LOG("Target key: %u, %016b\n", tg_key, tg_key);
+
+	// tg_key / 2 has same complement
+	uint16_t key = tg_key >> 1U, rem = tg_key & 1U;
+	count = bkt_counts[key];
+	// set the exists bit
+	bkt_exist_bits[key >> 6U] |= (uint64_t)(count != 0) << (key & 63U);
+	bkt_idx[key] = offset;
+	offset += count;
+
+	// tg_key / 2 + 1 may be the complement instead of itself
+	if (rem) {
+		uint16_t key_plus = key++;
+		uint16_t key_carry = key & 1U << (KEY_BITS - 1U);
+		count = bkt_counts[key_plus];
+		bkt_exist_bits[key_plus >> 6U] |= (uint64_t)(count != 0)
+						  << (key_plus & 63U);
+		bkt_idx[key_plus] = offset;
+		offset += count;
+
+		count = bkt_counts[key_carry];
+		bkt_exist_bits[key_carry >> 6U] |= (uint64_t)(count != 0)
+						   << (key_carry & 63U);
+		bkt_idx[key_carry] = offset;
+		offset += count;
+	}
 
 	// For every non-empty bucket with non-empty compliment bucket
-
-	// Compare highest magnitudes down
-
-	retvals[0] = 0;
-	retvals[1] = 1;
-
-	*returnsize = 2;
-	return retvals;
+	for (; key < tg_key; key++) {
+		if ((count = bkt_counts[key] == 0)) continue;
+		if ((count = bkt_counts[tg_key - key == 0])) continue;
+	}
 }
 
-int main()
+__attribute__((target("avx2"))) //
+void even_prefix(int* nums, int n, int target, uint32_t ptgt, uint8_t key_shift)
 {
-	int numsize = 16;
-	int nums[] = {2,
-		      7,
-		      4096,
-		      4097,
-		      99 - OFFSET,
-		      3 - (OFFSET / 2),
-		      8 - (OFFSET / 4),
-		      9 - (OFFSET / 8),
-		      100,
-		      101,
-		      102,
-		      103,
-		      1,
-		      4,
-		      5,
-		      6};
-	// NOTE: Demonstrate the shifting key_mask
-	int target = 12;
-	int retsize = 0;
-	int* retvals = NULL;
+	LOG("possible numbers per bucket is %u\n", 1U << (key_shift));
+	// All keybits but one will be a mask of nums
+	uint32_t num_mask = ((1U << ODD_BITS) - 1U) << (key_shift);
+	LOG("Key mask is:\t%032b\n", num_mask);
+	// Least signif keybit is complement carry flag
+	uint32_t carry_bit = 1U << (key_shift);
+	LOG("Low bit is:\t%032b\n", carry_bit);
 
-	TIME(retvals = twoSum(nums, numsize, target, &retsize););
+	// Calculate target key
+	uint16_t tg_key = ((ptgt & num_mask) >> key_shift) |
+			  ((uint16_t)target & 1U) << ODD_BITS;
+	LOG("Target key: %u, %016b\n", tg_key, tg_key);
 
-	if (retvals && nums[retvals[0]] + nums[retvals[1]] == target) {
-		free(retvals);
-		return 0;
+	const __m256i OFFSET_V = _mm256_set1_epi32(OFFSET);
+	const __m256i KEY_MASK_V = _mm256_set1_epi32((int)num_mask);
+	const __m256i LOW_BIT_V = _mm256_set1_epi32((int)carry_bit);
+	const __m256i ONE_BIT_V = _mm256_set1_epi32(1U);
+	const __m256i HIGH_BIT_V = _mm256_set1_epi32(1U << (KEY_BITS - 1U));
+	const __m256i EVEN_BIT_V = _mm256_set1_epi32(1U << (KEY_BITS - 2U));
+	const __m256i TARGET_V = _mm256_set1_epi32((int)ptgt);
+
+	// bkt_idx & bkt_counts share memory
+	uint16_t bkt_counts[NUM_BUCKETS] = {0};
+
+	// Start a new scope block because accs uses 32+ KB ( With 11+ bit
+	// key), and doesnt need to persist for the entire function. This
+	// reduces the total stack depth for if we need other arrays later, and
+	// helps to stay in cache somewhat. TODO: Measure this?
+	{
+		// 8 long arrays
+		uint16_t accs[8][NUM_BUCKETS] = {0};
+
+		for (int i = 0; i < n; i += 16) {
+			// Load 8 nums
+			__m256i vnums1 =
+				_mm256_loadu_si256((__m256i*)(nums + i));
+			__m256i vnums2 =
+				_mm256_loadu_si256((__m256i*)(nums + i + 8));
+			// Offset to positive
+			__m256i pnums1 = _mm256_add_epi32(vnums1, OFFSET_V);
+			__m256i pnums2 = _mm256_add_epi32(vnums2, OFFSET_V);
+			// Mask off key and shift to bottom of register
+			__m256i mask_nums1 =
+				_mm256_and_si256(pnums1, KEY_MASK_V);
+			__m256i mask_nums2 =
+				_mm256_and_si256(pnums2, KEY_MASK_V);
+			// Calculate full complement of nums[i]
+			__m256i compls1 = _mm256_sub_epi32(TARGET_V, pnums1);
+			__m256i compls2 = _mm256_sub_epi32(TARGET_V, pnums2);
+			VLOGB(compls1);
+
+			// Isolate the possibly overflowed low bit
+			// This is asking "does the complement have the bit set
+			// before the operation?"
+			__m256i carry1 = _mm256_cmpeq_epi32(
+				_mm256_andnot_si256(compls1, LOW_BIT_V),
+				LOW_BIT_V);
+			VLOGB(_mm256_and_si256(compls1, LOW_BIT_V));
+			VLOGB(carry1);
+			__m256i carry2 = _mm256_cmpeq_epi32(
+				_mm256_andnot_si256(compls2, LOW_BIT_V),
+				LOW_BIT_V);
+			// Is the num even or odd
+			__m256i even1 = _mm256_cmpeq_epi32(
+				_mm256_and_si256(vnums1, ONE_BIT_V), ONE_BIT_V);
+			VLOGB(even1);
+			__m256i even2 = _mm256_cmpeq_epi32(
+				_mm256_and_si256(vnums2, ONE_BIT_V), ONE_BIT_V);
+			// Shift 10 bit keys to bottom
+			__m256i shift_nums1 =
+				_mm256_srli_epi32(mask_nums1, key_shift);
+			__m256i shift_nums2 =
+				_mm256_srli_epi32(mask_nums2, key_shift);
+			// Apply even/odd bit to key
+			__m256i even_key1 = _mm256_or_si256(
+				_mm256_and_si256(even1, EVEN_BIT_V),
+				shift_nums1);
+			__m256i even_key2 = _mm256_or_si256(
+				_mm256_and_si256(even2, EVEN_BIT_V),
+				shift_nums2);
+			// Apply carry bit to key
+			__m256i ymmkeys1 = _mm256_or_si256(
+				_mm256_and_si256(carry1, HIGH_BIT_V),
+				even_key1);
+			__m256i ymmkeys2 = _mm256_or_si256(
+				_mm256_and_si256(carry2, HIGH_BIT_V),
+				even_key2);
+
+			// Due to store to load forwarding, we want
+			// these to be 32 bit And moved into general
+			// purpose registers once
+			alignas(32) uint32_t gpr_keys[16];
+
+			_mm256_store_si256((__m256i*)&gpr_keys[0], ymmkeys1);
+			_mm256_store_si256((__m256i*)&gpr_keys[8], ymmkeys2);
+
+			for (int j = 0; j < 16; j++) {
+				LOG("entry %u shifted: %u, %032b. Key: %u, "
+				    "%032b\n",
+				    nums[i + j], nums[i + j] + OFFSET,
+				    nums[i + j] + OFFSET, gpr_keys[j],
+				    gpr_keys[j]);
+			}
+
+			// no inter-lane dependency, look ahead can optimize
+			// NOTE: If data were larger, tiling would be better
+			// Tiling would use 8 * 16 buckets sets, and use mod 8
+			// indices via '& 7' paired with '>> 3' during indexing
+			accs[0][gpr_keys[0]]++;
+			accs[1][gpr_keys[1]]++;
+			accs[2][gpr_keys[2]]++;
+			accs[3][gpr_keys[3]]++;
+			accs[4][gpr_keys[4]]++;
+			accs[5][gpr_keys[5]]++;
+			accs[6][gpr_keys[6]]++;
+			accs[7][gpr_keys[7]]++;
+			accs[0][gpr_keys[8]]++;
+			accs[1][gpr_keys[9]]++;
+			accs[2][gpr_keys[10]]++;
+			accs[3][gpr_keys[11]]++;
+			accs[4][gpr_keys[12]]++;
+			accs[5][gpr_keys[13]]++;
+			accs[6][gpr_keys[14]]++;
+			accs[7][gpr_keys[15]]++;
+
+		} // End for
+		// TODO: tail
+
+		// reduce final bucket counts
+		for (uint32_t b = 0; b < NUM_BUCKETS; b += 16) {
+			__m256i t = _mm256_setzero_si256();
+
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[0][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[1][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[2][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[3][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[4][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[5][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[6][b]));
+			t = _mm256_add_epi16(
+				t, _mm256_loadu_si256((__m256i*)&accs[7][b]));
+			_mm256_storeu_si256((__m256i*)(bkt_counts + b), t);
+		}
+	} // end scope block
+
+	for (int a = 1260, b = a; b < a + 10; b++) {
+		LOG("bucket %u = %u\n", b, bkt_counts[b]);
 	}
-	free(retvals);
-	return 1;
+
+	// Store to hash (stack, obvi)
+	// uint8_t fingerp[n];
+	// uint32_t payload[n];
+
+	// Used to quickly check a bucket is considered before value to hash
+	uint64_t bkt_exist_bits[NUM_BUCKETS / 64] = {0};
+
+	uint16_t offset = 0, count;
+
+	// Need for bkt idx, and bkt counts are m-xclusive, so save ~4KB stack
+	uint16_t* bkt_idx = bkt_counts;
+
+	// Store complements adjacent
+	// Decompose target key into two solution keys
+	// Start at target key, and work down (ignoring keys above tgt)
+
+	// tg_key / 2 has same complement
+	uint16_t key = tg_key >> 1U, rem = tg_key & 1U;
+	count = bkt_counts[key];
+	// set the exists bit
+	bkt_exist_bits[key >> 6U] |= (uint64_t)(count != 0) << (key & 63U);
+	bkt_idx[key] = offset;
+	offset += count;
+
+	// tg_key / 2 + 1 may be the complement instead of itself
+	if (rem) {
+		uint16_t key_plus = key++;
+		uint16_t key_carry = key & 1U << (KEY_BITS - 1U);
+		count = bkt_counts[key_plus];
+		bkt_exist_bits[key_plus >> 6U] |= (uint64_t)(count != 0)
+						  << (key_plus & 63U);
+		bkt_idx[key_plus] = offset;
+		offset += count;
+
+		count = bkt_counts[key_carry];
+		bkt_exist_bits[key_carry >> 6U] |= (uint64_t)(count != 0)
+						   << (key_carry & 63U);
+		bkt_idx[key_carry] = offset;
+		offset += count;
+	}
+
+	// For every non-empty bucket with non-empty compliment bucket
+	for (; key < tg_key; key++) {
+		if ((count = bkt_counts[key] == 0)) continue;
+		if ((count = bkt_counts[tg_key - key == 0])) continue;
+	}
 }
 
 //==============================================================================
@@ -307,7 +596,8 @@ int main()
 // 	X(1)  X(2)  X(3)  X(4)  X(5)  X(6)  X(7)  X(8)  X(9)  X(10)
 // X(11)      \
 // 	X(12) X(13) X(14) X(15) X(16) X(17) X(18) X(19) X(20) X(21)
-// X(22)      \ 	X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30) X(31)
+// X(22)      \ 	X(23) X(24) X(25) X(26) X(27) X(28) X(29) X(30)
+// X(31)
 // 	// clang-format on
 //
 // 	// Make an accumulator ID for all 31 buckets
